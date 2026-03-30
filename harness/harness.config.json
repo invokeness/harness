@@ -1,0 +1,20 @@
+{
+  "backend": "claude",
+  "model": "opus",
+  "max_sprints": 20,
+  "max_retries": 3,
+  "backends": {
+    "claude-internal": {
+      "command": "claude-internal",
+      "args": ["--print", "--output-format", "text", "--dangerously-skip-permissions"]
+    },
+    "claude": {
+      "command": "claude",
+      "args": ["--print", "--output-format", "text", "--dangerously-skip-permissions"]
+    },
+    "codex": {
+      "command": "codex",
+      "args": ["--print", "--approval-mode", "full-auto"]
+    }
+  }
+}

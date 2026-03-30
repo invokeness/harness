@@ -1,0 +1,1241 @@
+#!/usr/bin/env bash
+#
+# harness — Planner→Generator→Evaluator Autonomous Harness CLI
+#
+# Based on: https://www.anthropic.com/engineering/harness-design-long-running-apps
+#
+# Usage:
+#   harness init               — Initialize .harness/ in current project
+#   harness run "requirements"  — Run the harness loop
+#   harness status             — Show current progress
+#
+set -uo pipefail
+# NOTE: no `set -e` — we handle errors manually so one agent failure doesn't kill the harness
+
+VERSION="1.0.0"
+
+# ─── Colors / Helpers ─────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+log()  { echo -e "${CYAN}[$(date '+%H:%M:%S')]${NC} $*"; }
+ok()   { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*"; }
+warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*"; }
+err()  { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*"; }
+
+banner() {
+  echo ""
+  echo -e "${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+  printf "${BOLD}║  %-58s║${NC}\n" "$1"
+  echo -e "${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo ""
+}
+
+usage() {
+  cat <<EOF
+${BOLD}harness${NC} v${VERSION} — Autonomous Planner→Generator→Evaluator Harness
+
+${BOLD}USAGE${NC}
+  harness init                       Initialize .harness/ in current directory
+  harness run [options] "prompt"     Run the harness loop
+  harness status                     Show current run progress
+  harness version                    Show version
+
+${BOLD}RUN OPTIONS${NC}
+  --backend <name>     Backend to use (default: from config or "claude")
+  --model <name>       Model to use (default: from config or "opus")
+  --file <path>        Read requirements from file instead of argument
+  --max-sprints <n>    Override max sprint count
+  --max-retries <n>    Override max retries per sprint
+
+${BOLD}EXAMPLES${NC}
+  harness init
+  harness run "Build a TODO CLI tool in Python"
+  harness run --backend codex --model o4-mini "Build a REST API"
+  harness run --file requirements.txt
+
+${BOLD}CONFIGURATION${NC}
+  Place harness.config.json in project root or .harness/ directory.
+  CLI arguments override config file values.
+  Config file is optional — sensible defaults are used without one.
+EOF
+}
+
+# ─── Resolve HARNESS_SELF_DIR (where the harness script itself lives) ────────
+HARNESS_SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ─── Config Defaults ─────────────────────────────────────────────────────────
+CFG_BACKEND="claude"
+CFG_MODEL="opus"
+CFG_MAX_SPRINTS=20
+CFG_MAX_RETRIES=3
+
+# Default backend definitions
+# Format: command|arg1|arg2|...
+# Using simple variables instead of associative arrays for bash 3.x compat
+BACKEND_DEF_claude_internal="claude-internal|--print|--output-format|text|--dangerously-skip-permissions"
+BACKEND_DEF_claude="claude|--print|--output-format|text|--dangerously-skip-permissions"
+BACKEND_DEF_codex="codex|--print|--approval-mode|full-auto"
+
+# Get backend definition by name
+get_backend_def() {
+  local name="$1"
+  local varname="BACKEND_DEF_${name//-/_}"
+  eval echo "\${${varname}:-}"
+}
+
+# Set backend definition by name
+set_backend_def() {
+  local name="$1"
+  local value="$2"
+  local varname="BACKEND_DEF_${name//-/_}"
+  eval "${varname}=\"${value}\""
+}
+
+# ─── JSON Helpers (portable, no jq dependency) ──────────────────────────────
+# Minimal JSON value extraction — handles simple string/number/bool values
+# Usage: json_get <json_string> <key>
+json_get() {
+  local json="$1" key="$2"
+  # Try string value first
+  local val
+  val=$(echo "$json" | grep -o "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" | head -1 | sed "s/\"${key}\"[[:space:]]*:[[:space:]]*\"//;s/\"$//")
+  if [[ -n "$val" ]]; then
+    echo "$val"
+    return
+  fi
+  # Try number/bool value
+  val=$(echo "$json" | grep -o "\"${key}\"[[:space:]]*:[[:space:]]*[0-9a-z]*" | head -1 | sed "s/\"${key}\"[[:space:]]*:[[:space:]]*//")
+  echo "$val"
+}
+
+# Extract a backend block from config JSON
+# Usage: json_get_backend <json_string> <backend_name>
+json_get_backend() {
+  local json="$1" name="$2"
+  # Extract command
+  local block
+  block=$(echo "$json" | tr '\n' ' ' | grep -o "\"${name}\"[[:space:]]*:[[:space:]]*{[^}]*}" | head -1)
+  if [[ -z "$block" ]]; then
+    return 1
+  fi
+  local cmd
+  cmd=$(echo "$block" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/"command"[[:space:]]*:[[:space:]]*"//;s/"$//')
+  # Extract args array
+  local args_str
+  args_str=$(echo "$block" | grep -o '"args"[[:space:]]*:[[:space:]]*\[[^]]*\]' | sed 's/"args"[[:space:]]*:[[:space:]]*\[//;s/\]$//')
+  # Convert JSON array to pipe-separated
+  local args
+  args=$(echo "$args_str" | tr -d ' ' | sed 's/","/ /g;s/"//g' | tr ' ' '|')
+  echo "${cmd}|${args}"
+}
+
+# ─── Load Config File ───────────────────────────────────────────────────────
+load_config() {
+  local config_file=""
+  # Search order: .harness/harness.config.json, ./harness.config.json
+  if [[ -f ".harness/harness.config.json" ]]; then
+    config_file=".harness/harness.config.json"
+  elif [[ -f "harness.config.json" ]]; then
+    config_file="harness.config.json"
+  fi
+
+  if [[ -z "$config_file" ]]; then
+    return 0  # No config file, use defaults
+  fi
+
+  log "Loading config from ${config_file}"
+  local json
+  json="$(cat "$config_file")"
+
+  local val
+  val=$(json_get "$json" "backend")
+  [[ -n "$val" ]] && CFG_BACKEND="$val"
+
+  val=$(json_get "$json" "model")
+  [[ -n "$val" ]] && CFG_MODEL="$val"
+
+  val=$(json_get "$json" "max_sprints")
+  [[ -n "$val" ]] && CFG_MAX_SPRINTS="$val"
+
+  val=$(json_get "$json" "max_retries")
+  [[ -n "$val" ]] && CFG_MAX_RETRIES="$val"
+
+  # Load custom backends from config
+  for name in claude-internal claude codex; do
+    local backend_def
+    backend_def=$(json_get_backend "$json" "$name" 2>/dev/null) || continue
+    if [[ -n "$backend_def" ]]; then
+      set_backend_def "$name" "$backend_def"
+    fi
+  done
+
+  # Also check for any custom backend names in the backends block
+  local backends_block
+  backends_block=$(echo "$json" | tr '\n' ' ' | grep -o '"backends"[[:space:]]*:[[:space:]]*{[^}]*}[^}]*}' | head -1)
+  if [[ -n "$backends_block" ]]; then
+    local custom_names
+    custom_names=$(echo "$backends_block" | grep -o '"[a-zA-Z0-9_-]*"[[:space:]]*:[[:space:]]*{' | sed 's/"//g;s/[[:space:]]*:[[:space:]]*{//')
+    for cname in $custom_names; do
+      if [[ -z "$(get_backend_def "$cname")" ]]; then
+        local cdef
+        cdef=$(json_get_backend "$json" "$cname" 2>/dev/null) || continue
+        if [[ -n "$cdef" ]]; then
+          set_backend_def "$cname" "$cdef"
+        fi
+      fi
+    done
+  fi
+}
+
+# ─── Build Agent Command ────────────────────────────────────────────────────
+# Usage: build_agent_cmd <backend> <model>
+# Sets AGENT_CMD and AGENT_PROMPT_FLAG
+build_agent_cmd() {
+  local backend="$1"
+  local model="$2"
+
+  local def
+  def="$(get_backend_def "$backend")"
+  if [[ -z "$def" ]]; then
+    err "Unknown backend: ${backend}"
+    err "Available backends: claude, claude-internal, codex (or define custom in config)"
+    exit 1
+  fi
+
+  IFS='|' read -ra parts <<< "$def"
+
+  AGENT_CMD=("${parts[0]}")
+  for ((i = 1; i < ${#parts[@]}; i++)); do
+    [[ -n "${parts[$i]}" ]] && AGENT_CMD+=("${parts[$i]}")
+  done
+
+  # Add model flag
+  if [[ -n "$model" ]]; then
+    AGENT_CMD+=("--model" "$model")
+  fi
+
+  # Determine prompt flag based on backend
+  if [[ "$backend" == "codex" ]]; then
+    AGENT_PROMPT_FLAG=""  # codex takes prompt as positional arg
+  else
+    AGENT_PROMPT_FLAG="-p"  # claude uses -p
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND: init
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_init() {
+  banner "Initializing Harness"
+
+  local harness_dir=".harness"
+
+  if [[ -d "$harness_dir" ]]; then
+    warn ".harness/ already exists. Re-initializing prompts and config..."
+  fi
+
+  mkdir -p "${harness_dir}/prompts" "${harness_dir}/sprints" "${harness_dir}/logs"
+
+  # Write default config
+  cat > "${harness_dir}/harness.config.json" <<'CONFIG_EOF'
+{
+  "backend": "claude",
+  "model": "opus",
+  "max_sprints": 20,
+  "max_retries": 3,
+  "backends": {
+    "claude-internal": {
+      "command": "claude-internal",
+      "args": ["--print", "--output-format", "text", "--dangerously-skip-permissions"]
+    },
+    "claude": {
+      "command": "claude",
+      "args": ["--print", "--output-format", "text", "--dangerously-skip-permissions"]
+    },
+    "codex": {
+      "command": "codex",
+      "args": ["--print", "--approval-mode", "full-auto"]
+    }
+  }
+}
+CONFIG_EOF
+  ok "Created ${harness_dir}/harness.config.json"
+
+  # Write prompt files — copy from bundled prompts if available, otherwise generate
+  local src_prompts="${HARNESS_SELF_DIR}/prompts"
+
+  if [[ -d "$src_prompts" ]]; then
+    cp "$src_prompts/planner.md" "${harness_dir}/prompts/planner.md"
+    cp "$src_prompts/generator.md" "${harness_dir}/prompts/generator.md"
+    cp "$src_prompts/evaluator.md" "${harness_dir}/prompts/evaluator.md"
+    cp "$src_prompts/sprint-contract-template.md" "${harness_dir}/prompts/sprint-contract-template.md"
+    ok "Copied prompt templates from ${src_prompts}/"
+  else
+    warn "Bundled prompts not found at ${src_prompts}. Writing defaults inline."
+    write_default_prompts "${harness_dir}/prompts"
+  fi
+
+  echo ""
+  ok "Harness initialized in ${harness_dir}/"
+  echo ""
+  echo -e "  ${BOLD}Next steps:${NC}"
+  echo -e "  1. Edit ${DIM}${harness_dir}/harness.config.json${NC} to set your preferred backend/model"
+  echo -e "  2. Optionally customize prompts in ${DIM}${harness_dir}/prompts/${NC}"
+  echo -e "  3. Run: ${BOLD}harness run \"your requirements\"${NC}"
+  echo ""
+}
+
+# Write default prompts inline (fallback if bundled prompts not found)
+write_default_prompts() {
+  local dir="$1"
+
+  cat > "${dir}/planner.md" <<'PROMPT_EOF'
+# Planner Agent — System Prompt
+
+You are the **Planner** in a Planner→Generator→Evaluator autonomous harness system.
+
+## Your Role
+
+You take a brief user requirement (1-4 sentences) and expand it into a comprehensive, actionable product specification (`spec.md`). This spec drives all downstream work — the Generator builds from it, the Evaluator grades against it.
+
+## Principles
+
+1. **Scope Ambition**: Don't just implement the minimum. Identify opportunities to make the product genuinely good — thoughtful UX, proper error handling, edge cases, accessibility.
+
+2. **Decompose into Sprints**: Break the work into 3-8 sprints. Each sprint should be:
+   - Independently testable
+   - Small enough to complete in one agent context window
+   - Ordered by dependency (foundations first, features later, polish last)
+
+3. **Technical Direction, Not Micromanagement**: Specify the *what* and *why*, not line-by-line *how*. The Generator is a competent developer — give it room to make implementation decisions.
+
+4. **Testable Criteria**: Every feature must have concrete, verifiable acceptance criteria. "The UI should look nice" is not testable. "The dashboard shows a sortable table with columns: Name, Status, Date, Actions" is testable.
+
+5. **AI Integration Opportunities**: Where appropriate, suggest where AI-powered features could enhance the product (smart defaults, natural language interfaces, intelligent suggestions).
+
+## Output Format
+
+Produce a Markdown document with this structure:
+
+```markdown
+# Product Spec: [Name]
+
+## Overview
+[2-3 sentence product description]
+
+## User Requirements (Original)
+[Exact user input, preserved verbatim]
+
+## Goals
+- [Goal 1]
+- [Goal 2]
+- ...
+
+## Technical Stack
+- [Recommended technologies with brief rationale]
+
+## Architecture Overview
+[High-level system design, data flow, key components]
+
+## Sprint Plan
+
+### Sprint 1: [Title — Foundation]
+**Goal**: [What this sprint achieves]
+**Deliverables**:
+- [ ] Deliverable 1
+- [ ] Deliverable 2
+**Acceptance Criteria**:
+- [ ] Criterion 1 (specific, testable)
+- [ ] Criterion 2
+
+### Sprint 2: [Title]
+...
+
+## Non-Functional Requirements
+- Performance: [specific targets]
+- Error Handling: [strategy]
+- Security: [considerations]
+- Code Quality: [standards]
+
+## Out of Scope
+- [What we're explicitly NOT building]
+```
+
+## Rules
+
+- Do NOT include implementation code in the spec
+- DO be specific about data models and API shapes
+- DO specify error states and edge cases
+- Every sprint should have 3-8 acceptance criteria
+- First sprint must establish project foundation (setup, config, basic structure)
+- Last sprint should be polish, testing, and documentation
+- Total sprint count: aim for 3-8 depending on project complexity
+PROMPT_EOF
+
+  cat > "${dir}/generator.md" <<'PROMPT_EOF'
+# Generator Agent — System Prompt
+
+You are the **Generator** in a Planner→Generator→Evaluator autonomous harness system. You are the builder. You write production-quality code.
+
+## Your Role
+
+You receive a spec and a sprint number, and you implement that sprint's deliverables. You write real, working code — create files, install dependencies, set up configurations, and produce functional software.
+
+## Sprint Contract — MANDATORY FIRST STEP
+
+**Before writing any code**, you MUST create a sprint contract file at the path specified in your instructions. Use the Write tool to create this file.
+
+The contract must include:
+- Exact deliverables (files to create/modify)
+- Testable success criteria (the Evaluator will grade against these — be specific)
+- What is explicitly out of scope for this sprint
+
+Do NOT start coding until the contract file is written.
+
+## Implementation Rules
+
+### Code Quality
+- Write clean, readable, well-structured code
+- Use meaningful variable and function names
+- Add comments for complex logic, not obvious code
+- Follow the conventions of the language/framework
+- Handle errors properly — no silent failures
+- No placeholder code, no TODO stubs, no "implement later" comments — if it's in scope, implement it fully
+
+### Git Discipline
+- Commit after completing the sprint implementation
+- Write clear commit messages: `sprint-N: [what changed]`
+- Never commit broken code
+
+### Self-Evaluation
+Before writing your sprint result report, evaluate your own work:
+1. Re-read every acceptance criterion in the contract
+2. Verify each one is genuinely met (not "close enough")
+3. Run the code if possible — does it actually work?
+4. Check edge cases — what happens with empty input? Invalid data?
+
+### File Communication
+- Write your sprint contract to the specified contract file path
+- Your STDOUT output becomes the sprint result report
+- The result report must include:
+  - What was built (summary)
+  - Files created or modified (full list)
+  - Self-evaluation against each contract criterion (PASS/FAIL with evidence)
+  - Any deviations from the contract (and why)
+  - Known limitations
+
+## Handling Evaluator Feedback
+
+If you receive previous evaluator feedback (meaning your last attempt was rejected):
+1. Read the feedback carefully — every single point
+2. Do NOT argue with the feedback — just fix the issues
+3. Do NOT introduce new scope — focus only on the fixes
+4. Address EVERY item the evaluator flagged, not just the easy ones
+5. In your result report, explicitly reference each feedback item and what you did
+
+## Sprint Result Report Format
+
+Your STDOUT output should follow this format:
+
+```markdown
+# Sprint N Result Report
+
+## Summary
+[2-3 sentences on what was accomplished]
+
+## Deliverables
+- [x] Deliverable 1: [brief description + key file paths]
+- [x] Deliverable 2: ...
+
+## Files Changed
+| File | Action | Description |
+|------|--------|-------------|
+| path/to/file | Created | Description |
+
+## Self-Evaluation
+| Criterion | Status | Evidence |
+|-----------|--------|----------|
+| Criterion from contract | PASS/FAIL | How verified |
+
+## Deviations from Contract
+[Any changes from original plan, with justification]
+
+## Known Issues
+[Honest list of any limitations]
+
+## Next Sprint Readiness
+[What the next sprint can build on]
+```
+
+## Critical Reminders
+
+- The Evaluator is STRICT and will read your actual code files. Do not lie about what you built.
+- If the contract says feature X, it must actually work end-to-end.
+- If you can't fully deliver something, say so honestly — don't hide failures.
+- When all spec work is done in this sprint, include "ALL SPRINTS COMPLETE" in your output.
+PROMPT_EOF
+
+  cat > "${dir}/evaluator.md" <<'PROMPT_EOF'
+# Evaluator Agent — System Prompt
+
+You are the **Evaluator** in a Planner→Generator→Evaluator autonomous harness system. You are the ruthless QA gatekeeper. Your only job is to PROTECT QUALITY.
+
+---
+
+## YOUR CORE MANDATE
+
+**You are the last line of defense against shipping broken, incomplete, or subpar work.**
+
+The Generator WILL try to convince you that things are "good enough." They are NOT good enough unless they meet EVERY criterion. You do not negotiate. You do not give partial credit. You do not round up.
+
+---
+
+## THE #1 ANTI-PATTERN YOU MUST AVOID
+
+> "I noticed the error handling is missing for edge case X... but overall the implementation looks solid, so I'll pass it."
+
+**THIS IS YOUR FAILURE MODE.** If you notice a problem, the sprint FAILS. Period.
+
+No "but overall..."
+No "minor issue but..."
+No "this could be improved later..."
+No "the core functionality works so..."
+
+If you find yourself writing justifications for why something is acceptable despite having issues — STOP IMMEDIATELY. That is your cognitive bias talking. The answer is FAIL.
+
+---
+
+## MANDATORY: VERIFY BY READING CODE
+
+You MUST use the Read tool to inspect actual source files the Generator claims to have created or modified. Do NOT trust self-assessment claims. If the Generator says "I implemented input validation", you MUST open the file and verify validation code exists AND is wired up correctly.
+
+---
+
+## Evaluation Process
+
+### Step 1: Check Sprint Contract Exists
+- If the contract file is missing → AUTOMATIC FAIL, stop here
+- Read the contract, extract every testable criterion
+
+### Step 2: Read the Actual Code
+For EACH criterion in the contract:
+- Use Read tool to open the relevant source files
+- Verify the claimed functionality actually exists in the code
+- Check that code is wired up (not dead code)
+- Look for obvious bugs, missing error handling, hardcoded values
+
+### Step 3: Grade Each Criterion
+- **PASS**: Code exists, is wired up, handles the stated requirement fully
+- **FAIL**: ANY of these → missing code, dead code, partial implementation, obvious bugs, missing error handling that was promised
+
+### Step 4: Check for Regressions
+- Did this sprint break anything from previous sprints?
+
+### Step 5: Issue Verdict
+- ALL criteria pass → `VERDICT: PASS`
+- ANY criterion fails → `VERDICT: FAIL`
+
+There is NO middle ground. There is NO "PASS with conditions."
+
+---
+
+## What to Look For
+
+### Code Quality Red Flags
+- Functions that exist but are never called (dead code)
+- Error handling that catches but swallows errors silently
+- API endpoints with no input validation
+- Hardcoded values that should be configurable
+- Missing imports or broken dependency chains
+- Empty function bodies or pass-through stubs
+- Comments saying "TODO" or "implement later"
+
+### Completeness Red Flags
+- Features in contract but not in code
+- UI components that render but have no event handlers
+- CRUD with Create but missing Update/Delete
+- Forms with no validation
+- Success paths work but error paths crash
+- Missing loading states, empty states, error states
+
+### Honesty Red Flags
+- Generator claims PASS but code doesn't support the claim
+- "Implemented" means file exists but function is a stub
+- Contract scope was quietly narrowed from the spec
+
+---
+
+## Output Format
+
+```markdown
+# Evaluator Report — Sprint N, Attempt M
+
+## Contract Criteria Evaluation
+
+### Criterion 1: [Name]
+**Generator's Claim**: [What they said]
+**Code Inspection**: [What you found in the actual files]
+**Files Checked**: [List of files you Read]
+**Grade**: PASS / FAIL
+**Issue** (if FAIL): [Specific problem]
+
+### Criterion 2: [Name]
+...
+
+## Additional Issues Found
+[Problems discovered during code review not covered by contract]
+
+## Summary
+- Criteria Passed: X / Y
+- Criteria Failed: Z / Y
+- Additional Issues: N
+
+## Required Fixes (if FAIL)
+1. [File: path/to/file] — [Exact, actionable fix]
+2. [File: path/to/file] — [Exact, actionable fix]
+
+## VERDICT: PASS / FAIL
+```
+
+---
+
+## Calibration: How a Good Evaluator Thinks
+
+### FAIL Examples (you MUST fail these)
+
+**Scenario**: Criterion says "User can create, read, update, and delete tasks"
+Generator claims all CRUD works. You read the code — delete endpoint returns 500.
+→ **FAIL**. 3 out of 4 is not 4 out of 4.
+
+**Scenario**: Criterion says "Form validates email format"
+Generator claims validation added. You read the code — regex exists in utils.js but is never imported or called in the form component.
+→ **FAIL**. Dead code is not a feature.
+
+**Scenario**: Criterion says "API returns proper error responses"
+Generator claims error handling implemented. You read the code — catch blocks exist but they all return `{ error: "Something went wrong" }` with no useful info.
+→ **FAIL**. Generic errors are not "proper error responses."
+
+### Self-Persuasion Traps (NEVER fall for these)
+
+❌ "The search has a bug with special characters, but core search works, so PASS"
+✅ "Search fails with special characters. FAIL."
+
+❌ "The styling doesn't match the spec exactly, but it's close enough and looks professional"
+✅ "Styling deviates from spec. FAIL."
+
+❌ "This works for the common case. Edge cases can be addressed in a future sprint"
+✅ "Edge cases not handled. FAIL."
+
+---
+
+## FINAL REMINDER
+
+You are NOT the Generator's colleague. You are NOT trying to be encouraging.
+You are the user's advocate. The user is paying for quality.
+Ship quality, or ship nothing.
+
+Every time you want to write "but overall..." — delete it and write "FAIL" instead.
+PROMPT_EOF
+
+  cat > "${dir}/sprint-contract-template.md" <<'PROMPT_EOF'
+# Sprint Contract — Sprint [N]
+
+**Date**: [timestamp]
+**Spec Reference**: spec.md
+**Previous Sprint**: [N-1 or "N/A — first sprint"]
+
+---
+
+## Sprint Goal
+[1-2 sentence description of what this sprint achieves]
+
+## Deliverables
+
+### Deliverable 1: [Name]
+- **Description**: [What will be built]
+- **Files**: [Expected files to create/modify]
+- **Dependencies**: [What this needs from previous sprints]
+
+### Deliverable 2: [Name]
+- **Description**: [What will be built]
+- **Files**: [Expected files to create/modify]
+- **Dependencies**: [What this needs from previous sprints]
+
+---
+
+## Testable Success Criteria
+
+Each criterion below will be independently evaluated by the Evaluator (who will read the actual code). ALL must pass.
+
+| # | Criterion | How to Verify |
+|---|-----------|---------------|
+| 1 | [Specific, measurable criterion] | [File to check + what to look for] |
+| 2 | [Specific, measurable criterion] | [File to check + what to look for] |
+| 3 | [Specific, measurable criterion] | [File to check + what to look for] |
+| 4 | [Specific, measurable criterion] | [File to check + what to look for] |
+
+---
+
+## Out of Scope
+- [What this sprint explicitly does NOT cover]
+- [Features deferred to later sprints]
+
+## Risks and Mitigations
+| Risk | Mitigation |
+|------|------------|
+| [Potential issue] | [How to handle it] |
+
+## Definition of Done
+- [ ] All success criteria pass
+- [ ] Code runs without errors
+- [ ] No regressions to previous sprint functionality
+- [ ] Git committed with clear message
+- [ ] Self-evaluation completed honestly
+PROMPT_EOF
+
+  ok "Default prompts written to ${dir}/"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND: status
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_status() {
+  local harness_dir=".harness"
+
+  if [[ ! -d "$harness_dir" ]]; then
+    echo -e "${DIM}No .harness/ directory found. Run 'harness init' first.${NC}"
+    exit 1
+  fi
+
+  if [[ ! -f "${harness_dir}/progress.md" ]]; then
+    echo -e "${BOLD}Harness Status${NC}"
+    echo ""
+    echo -e "  ${DIM}No runs yet.${NC}"
+    echo -e "  Run: ${BOLD}harness run \"your requirements\"${NC}"
+    echo ""
+
+    # Show config if exists
+    if [[ -f "${harness_dir}/harness.config.json" ]]; then
+      echo -e "${BOLD}Configuration:${NC}"
+      local json
+      json="$(cat "${harness_dir}/harness.config.json")"
+      echo -e "  Backend: ${CYAN}$(json_get "$json" "backend")${NC}"
+      echo -e "  Model:   ${CYAN}$(json_get "$json" "model")${NC}"
+      echo ""
+    fi
+    exit 0
+  fi
+
+  banner "Harness Status"
+
+  # Parse progress.md
+  local progress
+  progress="$(cat "${harness_dir}/progress.md")"
+
+  # Extract key info
+  local status run_id sprint_num
+  status=$(echo "$progress" | grep '^\*\*Status\*\*' | sed 's/.*: //')
+  run_id=$(echo "$progress" | grep '^\*\*Run ID\*\*' | sed 's/.*: //')
+  sprint_num=$(echo "$progress" | head -3 | grep -o 'Sprint [0-9]*' | head -1)
+
+  echo -e "  Run ID:  ${CYAN}${run_id:-unknown}${NC}"
+  echo -e "  Sprint:  ${BOLD}${sprint_num:-unknown}${NC}"
+
+  # Color-code status
+  case "$status" in
+    *COMPLETE*) echo -e "  Status:  ${GREEN}${status}${NC}" ;;
+    *FAILED*)   echo -e "  Status:  ${RED}${status}${NC}" ;;
+    *CAPPED*)   echo -e "  Status:  ${YELLOW}${status}${NC}" ;;
+    *)          echo -e "  Status:  ${CYAN}${status}${NC}" ;;
+  esac
+  echo ""
+
+  # Show completed sprints
+  local sprint_count
+  sprint_count=$(find "${harness_dir}/sprints" -name "sprint-*-result.md" 2>/dev/null | wc -l | tr -d ' ')
+  echo -e "  ${BOLD}Sprints completed:${NC} ${sprint_count}"
+
+  # Show sprint details
+  for result in "${harness_dir}/sprints"/sprint-*-result.md; do
+    [[ -f "$result" ]] || continue
+    local snum
+    snum=$(basename "$result" | grep -o '[0-9]*')
+    local first_line
+    first_line=$(grep -v '^$' "$result" | head -1)
+    local feedback="${harness_dir}/sprints/evaluator-feedback-${snum}.md"
+    if [[ -f "$feedback" ]] && grep -qi "VERDICT:.*PASS" "$feedback"; then
+      echo -e "    ${GREEN}✓${NC} Sprint ${snum}: ${first_line}"
+    elif [[ -f "$feedback" ]] && grep -qi "VERDICT:.*FAIL" "$feedback"; then
+      echo -e "    ${RED}✗${NC} Sprint ${snum}: ${first_line}"
+    else
+      echo -e "    ${YELLOW}?${NC} Sprint ${snum}: ${first_line}"
+    fi
+  done
+  echo ""
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# COMMAND: run
+# ═══════════════════════════════════════════════════════════════════════════════
+cmd_run() {
+  local cli_backend="" cli_model="" cli_file="" cli_max_sprints="" cli_max_retries=""
+  local user_req=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --backend)  cli_backend="$2"; shift 2 ;;
+      --model)    cli_model="$2"; shift 2 ;;
+      --file)     cli_file="$2"; shift 2 ;;
+      --max-sprints) cli_max_sprints="$2"; shift 2 ;;
+      --max-retries) cli_max_retries="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      -*)         err "Unknown option: $1"; usage; exit 1 ;;
+      *)          user_req="$1"; shift ;;
+    esac
+  done
+
+  # Load config
+  load_config
+
+  # CLI overrides
+  local BACKEND="${cli_backend:-$CFG_BACKEND}"
+  local MODEL="${cli_model:-$CFG_MODEL}"
+  local MAX_SPRINTS="${cli_max_sprints:-$CFG_MAX_SPRINTS}"
+  local MAX_SPRINT_RETRIES="${cli_max_retries:-$CFG_MAX_RETRIES}"
+
+  # Get requirements
+  if [[ -n "$cli_file" ]]; then
+    if [[ ! -f "$cli_file" ]]; then
+      err "Requirements file not found: ${cli_file}"
+      exit 1
+    fi
+    user_req="$(cat "$cli_file")"
+  fi
+
+  if [[ -z "$user_req" ]]; then
+    echo ""
+    echo -e "${BOLD}Enter your requirements (then press Enter):${NC}"
+    read -r user_req
+  fi
+
+  if [[ -z "$user_req" ]]; then
+    err "No requirements provided. Exiting."
+    exit 1
+  fi
+
+  # ─── Initialize .harness if not present ─────────────────────────────────────
+  local HARNESS_DIR=".harness"
+  if [[ ! -d "$HARNESS_DIR" ]]; then
+    log "No .harness/ found. Running init..."
+    cmd_init
+  fi
+
+  # ─── Setup paths ────────────────────────────────────────────────────────────
+  local PROJECT_DIR="$(pwd)"
+  local PROMPTS_DIR="${HARNESS_DIR}/prompts"
+  local LOGS_DIR="${HARNESS_DIR}/logs"
+  local SPRINTS_DIR="${HARNESS_DIR}/sprints"
+  local SPEC_FILE="${HARNESS_DIR}/spec.md"
+  local PROGRESS_FILE="${HARNESS_DIR}/progress.md"
+
+  mkdir -p "$LOGS_DIR" "$SPRINTS_DIR"
+
+  local RUN_ID="run-$(date '+%Y%m%d-%H%M%S')"
+  local RUN_LOG="${LOGS_DIR}/${RUN_ID}.log"
+
+  # Tee all output to log
+  exec > >(tee -a "$RUN_LOG") 2>&1
+
+  # ─── Build agent command ────────────────────────────────────────────────────
+  build_agent_cmd "$BACKEND" "$MODEL"
+
+  banner "Autonomous Harness: Planner → Generator → Evaluator"
+  log "Run ID:      ${RUN_ID}"
+  log "Project dir: ${PROJECT_DIR}"
+  log "Backend:     ${BACKEND}"
+  log "Model:       ${MODEL}"
+  log "Max sprints: ${MAX_SPRINTS}"
+  log "Max retries: ${MAX_SPRINT_RETRIES}"
+  log "Logs:        ${RUN_LOG}"
+
+  log "Requirements: ${user_req}"
+  echo "$user_req" > "${HARNESS_DIR}/user-requirements.txt"
+
+  # ─── Helper: Run agent ────────────────────────────────────────────────────
+  run_agent() {
+    local system_prompt_file="$1"
+    local user_message="$2"
+    local output_file="$3"
+    local log_label="$4"
+
+    local agent_log="${LOGS_DIR}/${RUN_ID}-${log_label}.log"
+
+    log "  Agent: ${log_label}"
+
+    local full_prompt
+    full_prompt="Read your system prompt instructions from: ${system_prompt_file}
+
+---
+
+${user_message}"
+
+    local exit_code=0
+    if [[ -n "$AGENT_PROMPT_FLAG" ]]; then
+      "${AGENT_CMD[@]}" "$AGENT_PROMPT_FLAG" "$full_prompt" \
+        2>"$agent_log" \
+        > "$output_file" || exit_code=$?
+    else
+      "${AGENT_CMD[@]}" "$full_prompt" \
+        2>"$agent_log" \
+        > "$output_file" || exit_code=$?
+    fi
+
+    if [[ $exit_code -ne 0 ]] || [[ ! -s "$output_file" ]]; then
+      err "Agent ${log_label} failed (exit=${exit_code}). Log: ${agent_log}"
+      err "Output content: $(head -5 "$output_file" 2>/dev/null || echo '(empty)')"
+      return 1
+    fi
+
+    ok "  Agent ${log_label} done -> ${output_file}"
+  }
+
+  # ─── Helper: Run generator agent ──────────────────────────────────────────
+  run_generator_agent() {
+    local system_prompt_file="$1"
+    local user_message="$2"
+    local output_file="$3"
+    local log_label="$4"
+
+    local agent_log="${LOGS_DIR}/${RUN_ID}-${log_label}.log"
+
+    log "  Generator Agent: ${log_label}"
+
+    local full_prompt
+    full_prompt="Read your system prompt instructions from: ${system_prompt_file}
+
+---
+
+${user_message}
+
+IMPORTANT: You are running in the project directory: ${PROJECT_DIR}
+After implementing, write your sprint result report to STDOUT.
+Also write the sprint contract to the specified contract file path using the Write tool."
+
+    local exit_code=0
+    if [[ -n "$AGENT_PROMPT_FLAG" ]]; then
+      "${AGENT_CMD[@]}" "$AGENT_PROMPT_FLAG" "$full_prompt" \
+        2>"$agent_log" \
+        > "$output_file" || exit_code=$?
+    else
+      "${AGENT_CMD[@]}" "$full_prompt" \
+        2>"$agent_log" \
+        > "$output_file" || exit_code=$?
+    fi
+
+    if [[ $exit_code -ne 0 ]] || [[ ! -s "$output_file" ]]; then
+      err "Generator ${log_label} failed (exit=${exit_code}). Log: ${agent_log}"
+      err "Output content: $(head -5 "$output_file" 2>/dev/null || echo '(empty)')"
+      return 1
+    fi
+
+    ok "  Generator ${log_label} done -> ${output_file}"
+  }
+
+  # ─── Helper: Git info ──────────────────────────────────────────────────────
+  get_git_hash() {
+    if git rev-parse --git-dir &>/dev/null; then
+      git rev-parse --short HEAD 2>/dev/null || echo "no-git"
+    else
+      echo "no-git"
+    fi
+  }
+
+  # ─── Helper: Write progress.md ─────────────────────────────────────────────
+  write_progress() {
+    local sprint_num="$1"
+    local status="$2"
+    local next_task="$3"
+    local known_issues="${4:-none}"
+
+    local completed_list=""
+    for i in $(seq 1 "$sprint_num"); do
+      local result_file="${SPRINTS_DIR}/sprint-${i}-result.md"
+      if [[ -f "$result_file" ]]; then
+        completed_list="${completed_list}
+- Sprint ${i}: $(head -5 "$result_file" | grep -v '^$' | head -1)"
+      fi
+    done
+
+    cat > "$PROGRESS_FILE" <<PROGRESS_EOF
+# Progress Report — Sprint ${sprint_num}
+
+**Generated**: $(date '+%Y-%m-%d %H:%M:%S')
+**Run ID**: ${RUN_ID}
+**Git Commit**: $(get_git_hash)
+**Status**: ${status}
+**Backend**: ${BACKEND}
+**Model**: ${MODEL}
+
+## User Requirements
+${user_req}
+
+## Spec File
+See: ${SPEC_FILE}
+
+## Completed Sprints
+${completed_list}
+
+## Current Sprint: ${sprint_num}
+Status: ${status}
+
+## Next Task
+${next_task}
+
+## Known Issues
+${known_issues}
+
+## Files Modified This Run
+$(git diff --name-only 2>/dev/null | head -30 || echo "(not a git repo or no changes)")
+PROGRESS_EOF
+
+    ok "progress.md updated (sprint ${sprint_num}, ${status})"
+  }
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # PHASE 1: PLANNER
+  # ═════════════════════════════════════════════════════════════════════════════
+  banner "Phase 1: Planner — Generating Spec"
+
+  # Gather existing project context
+  local EXISTING_FILES
+  EXISTING_FILES="$(find "$PROJECT_DIR" -maxdepth 2 -type d \
+    -not -path '*/node_modules/*' \
+    -not -path '*/.git/*' \
+    -not -path '*/.harness/*' \
+    -not -path '*/harness/*' \
+    -not -path '*/__pycache__/*' \
+    -not -path '*/.venv/*' \
+    -not -path '*/.mypy_cache/*' \
+    -not -path '*/.ruff_cache/*' \
+    2>/dev/null | head -30 || echo "(empty project)")"
+
+  local KEY_FILES
+  KEY_FILES="$(find "$PROJECT_DIR" -maxdepth 2 \( -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.go' -o -name '*.rs' \) -type f \
+    -not -path '*/__pycache__/*' \
+    -not -path '*/.venv/*' \
+    -not -path '*/node_modules/*' \
+    2>/dev/null | head -20 || echo "")"
+
+  local PLANNER_INPUT="## User Requirements
+${user_req}
+
+## Project Directory
+${PROJECT_DIR}
+
+## Directory Structure
+${EXISTING_FILES}
+
+## Key Source Files
+${KEY_FILES}
+
+## Instructions
+First use the Read and Glob tools to explore the project structure and understand the codebase.
+Then generate a comprehensive spec.md based on the above requirements.
+Output ONLY the spec content in Markdown format, nothing else."
+
+  run_agent \
+    "${PROMPTS_DIR}/planner.md" \
+    "$PLANNER_INPUT" \
+    "$SPEC_FILE" \
+    "planner"
+
+  # Validate planner output
+  if [[ ! -s "$SPEC_FILE" ]] || head -1 "$SPEC_FILE" | grep -qi "error"; then
+    err "Planner failed to generate a valid spec. Aborting."
+    err "Content: $(head -3 "$SPEC_FILE" 2>/dev/null)"
+    exit 1
+  fi
+
+  log "Spec generated: $(wc -l < "$SPEC_FILE") lines"
+
+  # ═════════════════════════════════════════════════════════════════════════════
+  # PHASE 2: Sprint Loop — Generator → Evaluator
+  # ═════════════════════════════════════════════════════════════════════════════
+  banner "Phase 2: Sprint Execution Loop"
+
+  local SPRINT_NUM=0
+  local TOTAL_START=$SECONDS
+
+  while [[ $SPRINT_NUM -lt $MAX_SPRINTS ]]; do
+    SPRINT_NUM=$((SPRINT_NUM + 1))
+    local RETRY_COUNT=0
+    local SPRINT_PASSED=false
+
+    local SPRINT_START=$SECONDS
+    banner "Sprint ${SPRINT_NUM} / max ${MAX_SPRINTS}"
+
+    local SPRINT_RESULT="${SPRINTS_DIR}/sprint-${SPRINT_NUM}-result.md"
+    local SPRINT_CONTRACT="${SPRINTS_DIR}/sprint-${SPRINT_NUM}-contract.md"
+    local EVALUATOR_FEEDBACK="${SPRINTS_DIR}/evaluator-feedback-${SPRINT_NUM}.md"
+
+    local PREV_FEEDBACK=""
+
+    # ─── Sprint Retry Loop ───────────────────────────────────────────────────
+    while [[ $RETRY_COUNT -lt $MAX_SPRINT_RETRIES ]]; do
+
+      log "Sprint ${SPRINT_NUM}, attempt $((RETRY_COUNT + 1))/${MAX_SPRINT_RETRIES}"
+
+      # ─── GENERATOR ──────────────────────────────────────────────────────────
+      local GENERATOR_INPUT="## Your Task
+You are executing Sprint ${SPRINT_NUM} of the project.
+
+## Key Files (use Read tool to access these)
+- **Spec**: ${SPEC_FILE}
+- **Sprint Contract Template**: ${PROMPTS_DIR}/sprint-contract-template.md
+- **Previous Progress**: ${PROGRESS_FILE}
+- **Project Directory**: ${PROJECT_DIR}
+
+## Previous Evaluator Feedback (if any)
+${PREV_FEEDBACK}
+
+## Contract File Path
+${SPRINT_CONTRACT}
+
+## Instructions
+1. Read the spec file first: ${SPEC_FILE}
+2. Read the sprint contract template: ${PROMPTS_DIR}/sprint-contract-template.md
+3. Write a sprint contract to: ${SPRINT_CONTRACT}
+4. Explore the project directory and implement the sprint deliverables.
+5. Self-evaluate your work against the contract criteria.
+6. Git commit your changes with message: \"sprint-${SPRINT_NUM}: [description]\"
+7. Write a detailed sprint result report to STDOUT.
+
+If this sprint completes all work in the spec, include 'ALL SPRINTS COMPLETE' in your output."
+
+      run_generator_agent \
+        "${PROMPTS_DIR}/generator.md" \
+        "$GENERATOR_INPUT" \
+        "$SPRINT_RESULT" \
+        "generator-s${SPRINT_NUM}-a$((RETRY_COUNT + 1))"
+
+      # If generator failed, skip evaluator and retry
+      if [[ ! -s "$SPRINT_RESULT" ]] || head -1 "$SPRINT_RESULT" | grep -qi "error"; then
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        warn "Generator failed (empty or error output), retry ${RETRY_COUNT}/${MAX_SPRINT_RETRIES}"
+        PREV_FEEDBACK="Generator crashed or returned an error. Try again."
+        if [[ $RETRY_COUNT -ge $MAX_SPRINT_RETRIES ]]; then
+          err "Sprint ${SPRINT_NUM} generator failed after ${MAX_SPRINT_RETRIES} attempts!"
+          write_progress "$SPRINT_NUM" "FAILED" "Generator keeps failing" "See logs"
+        fi
+        continue
+      fi
+
+      # ─── EVALUATOR ──────────────────────────────────────────────────────────
+      log "Evaluator reviewing sprint ${SPRINT_NUM}..."
+
+      local EVALUATOR_INPUT="## Your Task
+Evaluate Sprint ${SPRINT_NUM}, Attempt $((RETRY_COUNT + 1)) of ${MAX_SPRINT_RETRIES}.
+
+## Key Files (use Read tool to access these)
+- **Spec**: ${SPEC_FILE}
+- **Sprint Contract**: ${SPRINT_CONTRACT}
+- **Sprint Result Report**: ${SPRINT_RESULT}
+- **Project Directory**: ${PROJECT_DIR}
+
+## Instructions
+1. Read the sprint contract: ${SPRINT_CONTRACT}
+2. Read the sprint result report: ${SPRINT_RESULT}
+3. For EACH criterion in the contract, use Read tool to inspect the actual source files.
+4. Do NOT trust the Generator's self-assessment — verify by reading code.
+5. Be RUTHLESSLY strict.
+
+Output your evaluation in Markdown. End with exactly one of:
+  VERDICT: PASS
+  VERDICT: FAIL"
+
+      run_agent \
+        "${PROMPTS_DIR}/evaluator.md" \
+        "$EVALUATOR_INPUT" \
+        "$EVALUATOR_FEEDBACK" \
+        "evaluator-s${SPRINT_NUM}-a$((RETRY_COUNT + 1))"
+
+      # ─── Check Verdict ──────────────────────────────────────────────────────
+      if grep -qi "VERDICT:.*PASS" "$EVALUATOR_FEEDBACK"; then
+        ok "Sprint ${SPRINT_NUM} PASSED! (attempt $((RETRY_COUNT + 1)))"
+        SPRINT_PASSED=true
+        break
+      else
+        RETRY_COUNT=$((RETRY_COUNT + 1))
+        warn "Sprint ${SPRINT_NUM} FAILED (attempt ${RETRY_COUNT}/${MAX_SPRINT_RETRIES})"
+
+        PREV_FEEDBACK="## Evaluator REJECTED your previous attempt.
+Read the full feedback here: ${EVALUATOR_FEEDBACK}
+You MUST use the Read tool to read that file and address EVERY issue. Do not skip any. Do not argue. Fix them."
+
+        if [[ $RETRY_COUNT -ge $MAX_SPRINT_RETRIES ]]; then
+          err "Sprint ${SPRINT_NUM} exhausted all ${MAX_SPRINT_RETRIES} attempts!"
+          write_progress "$SPRINT_NUM" "FAILED" \
+            "Sprint ${SPRINT_NUM} needs human intervention" \
+            "$(tail -30 "$EVALUATOR_FEEDBACK")"
+        fi
+      fi
+    done
+
+    local SPRINT_ELAPSED=$(( SECONDS - SPRINT_START ))
+    log "Sprint ${SPRINT_NUM} took ${SPRINT_ELAPSED}s"
+
+    # ─── Post-Sprint ──────────────────────────────────────────────────────────
+    if [[ "$SPRINT_PASSED" == "true" ]]; then
+      if grep -qi "ALL SPRINTS COMPLETE\|no further sprints\|project complete" "$SPRINT_RESULT"; then
+        write_progress "$SPRINT_NUM" "COMPLETE" "All done!" "none"
+
+        local TOTAL_ELAPSED=$(( SECONDS - TOTAL_START ))
+        banner "PROJECT COMPLETE"
+        ok "Finished after ${SPRINT_NUM} sprint(s) in ${TOTAL_ELAPSED}s"
+        ok "Spec:     ${SPEC_FILE}"
+        ok "Progress: ${PROGRESS_FILE}"
+        ok "Logs:     ${LOGS_DIR}/"
+        exit 0
+      fi
+
+      write_progress "$SPRINT_NUM" "completed" \
+        "Proceed to sprint $((SPRINT_NUM + 1))" "none"
+    fi
+  done
+
+  # ─── Safety cap ─────────────────────────────────────────────────────────────
+  banner "MAX SPRINTS REACHED (${MAX_SPRINTS})"
+  write_progress "$SPRINT_NUM" "CAPPED" \
+    "Hit max sprint limit. Human review needed." \
+    "Stopped at sprint cap."
+
+  local TOTAL_ELAPSED=$(( SECONDS - TOTAL_START ))
+  warn "Stopped after ${MAX_SPRINTS} sprints, ${TOTAL_ELAPSED}s total."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN: Parse subcommand
+# ═══════════════════════════════════════════════════════════════════════════════
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+SUBCOMMAND="$1"
+shift
+
+case "$SUBCOMMAND" in
+  init)    cmd_init "$@" ;;
+  run)     cmd_run "$@" ;;
+  status)  cmd_status "$@" ;;
+  version) echo "harness v${VERSION}" ;;
+  -h|--help|help) usage ;;
+  *)
+    err "Unknown command: ${SUBCOMMAND}"
+    echo ""
+    usage
+    exit 1
+    ;;
+esac
