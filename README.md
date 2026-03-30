@@ -1,5 +1,11 @@
 # Harness — 让 AI 自动帮你写整个项目
 
+[English](#english) | [中文](#中文)
+
+---
+
+<a name="中文"></a>
+
 你只需要一句话描述需求，Harness 就会自动规划、写代码、检查质量，循环往复直到完成。全程不需要你盯着。
 
 > 基于 [Anthropic 的 Harness 设计理念](https://www.anthropic.com/engineering/harness-design-long-running-apps)
@@ -162,6 +168,175 @@ A: 取决于需求复杂度。简单项目 3-5 个 Sprint 大概 10-30 分钟。
 
 **Q: 一直 FAIL 过不了怎么办？**
 A: 看 `.harness/sprints/evaluator-feedback-*.md` 里的反馈，可能是需求描述不够清晰，或者评估器太严格（可以改 `evaluator.md`）。
+
+---
+
+<a name="english"></a>
+
+# Harness — Let AI Build Your Entire Project
+
+Just describe what you want in one sentence. Harness will plan, code, review, and iterate — all on its own. No babysitting needed.
+
+> Based on [Anthropic's Harness Design for Long-Running Apps](https://www.anthropic.com/engineering/harness-design-long-running-apps)
+
+## What Does It Do?
+
+Tell it "Build me a TODO CLI tool", and it will:
+
+1. 🧠 **Plan automatically** — Break your request into small tasks (Sprints)
+2. 💻 **Write code automatically** — Complete each Sprint and auto git commit
+3. 🔍 **Review automatically** — Strictly check code quality, rewrite if it fails
+4. 🔁 **Loop until done** — Only stops when all Sprints pass review
+
+Go grab a coffee. The code will be ready when you get back.
+
+## Get Started in 2 Steps
+
+### Step 1: Install Claude Code or Codex
+
+Harness needs an AI coding tool as its engine. Pick one:
+
+| Tool | Install | Notes |
+|------|---------|-------|
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | `npm install -g @anthropic-ai/claude-code` | By Anthropic, recommended |
+| [Codex](https://github.com/openai/codex) | `npm install -g @openai/codex` | By OpenAI |
+
+Verify it works: `claude --version` or `codex --version` should print a version number.
+
+### Step 2: Install Harness
+
+```bash
+# Download
+git clone https://github.com/invokeness/harness.git ~/harness
+
+# Create a shortcut so you can run 'harness' from anywhere
+# Note: the executable is at harness/harness/harness
+sudo ln -s ~/harness/harness/harness /usr/local/bin/harness
+```
+
+Done. Run `harness version` — if you see a version number, you're good to go.
+
+## How to Use
+
+### The Simplest Way (3 Commands)
+
+```bash
+# 1. Go to your project folder (empty folder is fine)
+cd my-project
+
+# 2. Initialize (only needed the first time)
+harness init
+
+# 3. Tell it what you want, then sit back
+harness run "Build a Python TODO CLI tool with CRUD operations"
+```
+
+That's it. It will plan, code, review, and fix — then tell you "PROJECT COMPLETE" when it's done.
+
+### Check progress?
+
+```bash
+harness status
+```
+
+### Use Codex instead of Claude?
+
+```bash
+harness run --backend codex "your requirements"
+```
+
+### Switch models?
+
+```bash
+harness run --model sonnet "your requirements"
+```
+
+### Long requirements? Use a file
+
+```bash
+harness run --file requirements.txt
+```
+
+## Configuration (Optional — Works Fine Without It)
+
+`harness init` generates `.harness/harness.config.json`:
+
+```json
+{
+  "backend": "claude",
+  "model": "opus",
+  "max_sprints": 20,
+  "max_retries": 3
+}
+```
+
+| What to Change | How | What It Means |
+|----------------|-----|---------------|
+| Switch engine | `"backend": "codex"` | Use Codex instead of Claude |
+| Switch model | `"model": "sonnet"` | Use a faster/cheaper model |
+| Sprint limit | `"max_sprints": 10` | Max iterations (prevents infinite loops) |
+| Retry limit | `"max_retries": 5` | Max retries when review fails |
+
+## What Files Does It Create?
+
+After a run, you'll find a `.harness/` folder in your project:
+
+```
+.harness/
+├── harness.config.json     ← Your config
+├── prompts/                ← AI instruction templates (editable)
+├── spec.md                 ← Auto-generated product spec
+├── progress.md             ← Current progress
+├── sprints/                ← Sprint contracts, results, review feedback
+└── logs/                   ← Run logs (check here if something breaks)
+```
+
+Your code files live in the project root as usual. `.harness/` only stores Harness's own records.
+
+## Advanced Usage
+
+### Customize AI Behavior
+
+After `harness init`, there are 4 files in `.harness/prompts/` that control how the AI works:
+
+| File | What It Does |
+|------|-------------|
+| `planner.md` | How AI plans the project |
+| `generator.md` | How AI writes code |
+| `evaluator.md` | How AI reviews code (tweak this to adjust strictness) |
+| `sprint-contract-template.md` | Sprint contract template |
+
+Reviews too strict and keeps failing? Open `evaluator.md` and loosen the standards.
+
+### Add Custom Backends
+
+Besides Claude and Codex, you can use any CLI AI tool. Add a backends entry in config:
+
+```json
+{
+  "backends": {
+    "my-tool": {
+      "command": "my-tool",
+      "args": ["--some-flag"]
+    }
+  },
+  "backend": "my-tool"
+}
+```
+
+## FAQ
+
+**Q: What if it stops halfway?**
+A: Resume isn't supported yet — re-run `harness run`. Previously committed code is still there.
+
+**Q: Will it break my existing code?**
+A: The Generator auto-commits with git, so you can always `git log` to see changes and `git revert` to roll back. We recommend running on a new branch.
+
+**Q: How long does a run take? How much does it cost?**
+A: Depends on complexity. A simple project with 3-5 Sprints takes about 10-30 minutes. Cost depends on your model and backend.
+
+**Q: It keeps failing review — what do I do?**
+A: Check `.harness/sprints/evaluator-feedback-*.md` for feedback. Your requirements might be unclear, or the evaluator might be too strict (edit `evaluator.md`).
 
 ## License
 
